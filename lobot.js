@@ -1,3 +1,5 @@
+const commandstate = new Map();
+
 function onBotPlay(game, playerNumber) {
     // INITS
     const allUnits = game.getUnits();
@@ -29,9 +31,8 @@ function onBotPlay(game, playerNumber) {
 
 
     turnSubmission.formationChanges.push(...infantryFormationChanges(myinf, visibleEnemyUnits));
-    const playerTwoRotation = Math.PI / 2;
-    const finalRotation = playerNumber === 1 ? 3 * Math.PI / 2 : playerTwoRotation;
-    turnSubmission.orders.push(...infcommander(game, myinf, finalRotation));
+    const playerValues = initplayervalues(game, playerNumber);
+    turnSubmission.orders.push(...infcommander(game, myinf, playerValues));
 
 
 
@@ -60,7 +61,17 @@ function infantryFormationChanges(infantry, visibleEnemyUnits) {
     return formationChanges;
 }
 
-function infcommander(game, infantry, finalRotation) {
+function initplayervalues(game, playerNumber) {
+    const rotationtoenemy = playerNumber === 1 ? 3 * Math.PI / 2 : Math.PI / 2;
+    const mapfarthesty = playerNumber === 1 ? 0 : game.map.height;
+
+    return new Map([
+        ["rotationtoenemy", rotationtoenemy],
+        ["mapfarthesty", mapfarthesty]
+    ]);
+}
+
+function infcommander(game, infantry, playerValues) {
     const orders = [];
     const readyInfantry = infantry.filter(unit => !unit.isRoutingOrRecovering());
     if (readyInfantry.length === 0) {
@@ -72,21 +83,57 @@ function infcommander(game, infantry, finalRotation) {
     const frontamt=getAmountThatFits(lcentpos, rcentpos, lineWidth);
     const rearamt=readyInfantry.length-frontamt;
 
-    console.log(frontamt, rearamt,lineWidth,lineFormation, lcentpos, rcentpos)
+    console.log(frontamt, rearamt,lineWidth,lineFormation, lcentpos, rcentpos,commandstate);
+    
 
+    if (commandstate.size === 0) {
+        initializecommandstate(
+            infantry,
+            lcentpos,
+            rcentpos,
+            frontamt
+        );
+    }
+    if (mostinfinposition(readyInfantry)) {
+        commandstate.set("phase", "attack");
+    }
 
-    const positions = getEquallySpacedPositions(lcentpos, rcentpos, frontamt);
+    const oglineY=commandstate.get("oglineY");
+    const stagingpositions=commandstate.get("stagingpositions");
+    const phase = commandstate.get("phase");
 
-    readyInfantry.slice(0, frontamt).forEach((unit, index) => {
-        const position = positions[index];
-        orders.push({
-            type: 4, // FAA
-            id: unit.id,
-            path: [[position.x, position.y]],
-            rotation: finalRotation
+    
+    if (phase === "staging") {
+        readyInfantry.slice(0, frontamt).forEach((unit, index) => {
+            const position = stagingpositions[index];
+            orders.push({
+                type: 4,
+                id: unit.id,
+                path: [[position.x, position.y]],
+                rotation: playerValues.get("rotationtoenemy")
+            });
         });
-    });
+    } else if (phase === "attack") {
+        const positions = getEquallySpacedPositions(
+            lcentpos,
+            rcentpos,
+            frontamt,
+            playerValues.get("mapfarthesty")
+        );
 
+        readyInfantry.slice(0, frontamt).forEach((unit, index) => {
+            const position = positions[index];
+            orders.push({
+                type: 4, // FAA
+                id: unit.id,
+                path: [[position.x, position.y]],
+                rotation: playerValues.get("rotationtoenemy")
+            });
+        });
+        
+    }
+
+    // ignore reserves for now
     // readyInfantry.slice(lineCount).forEach((unit, index) => {
     //     const linePosition = linePositions[index % linePositions.length];
     //     const reserveRow = Math.floor(index / linePositions.length) + 1;
@@ -99,6 +146,31 @@ function infcommander(game, infantry, finalRotation) {
     // });
 
     return orders;
+}
+
+function initializecommandstate(infantry, lcentpos, rcentpos, frontamt) {
+    const oglineY = infantry.reduce((total, unit) => total + unit.position.y, 0) / infantry.length;
+    const stagingY = (oglineY + lcentpos.y) / 2;
+    const stagingpositions = getEquallySpacedPositions(
+        lcentpos,
+        rcentpos,
+        frontamt,
+        stagingY
+    );
+
+    commandstate.set("oglineY", oglineY);
+    commandstate.set("stagingpositions", stagingpositions);
+    commandstate.set("phase", "staging");
+}
+
+function mostinfinposition(infantry,threshold=10,percent=1) {
+    const positions=commandstate.get("stagingpositions");
+    const infantryToCheck = infantry.slice(0, positions.length);
+    const inPositionCount = infantryToCheck.filter((unit, index) => {
+        return unit.position.distanceTo(positions[index]) <= threshold;
+    }).length;
+
+    return inPositionCount / infantryToCheck.length >= percent;
 }
 
 function getlineinfo(readyInfantry) {
@@ -135,22 +207,6 @@ function getobjectiveinfo(game) {
     };
 }
 
-// function calculateLinePositions(linePlacement, lineWidth, infantryCount) {
-//     const startPosition = {
-//         x: linePlacement.lineStartX,
-//         y: linePlacement.lineY
-//     };
-//     const endPosition = {
-//         x: linePlacement.lineStartX + linePlacement.lineLength,
-//         y: linePlacement.lineY
-//     };
-//     const maximumLineCount = getAmountThatFits(startPosition, endPosition, lineWidth);
-//     const lineCount = Math.min(infantryCount, maximumLineCount);
-//     const linePositions = getEquallySpacedPositions(startPosition, endPosition, lineCount);
-
-//     return { linePositions, lineCount };
-// }
-
 function getAmountThatFits(startPosition, endPosition, width) {
     const distanceX = endPosition.x - startPosition.x;
     const distanceY = endPosition.y - startPosition.y;
@@ -159,7 +215,7 @@ function getAmountThatFits(startPosition, endPosition, width) {
     return Math.floor(distance / width);
 }
 
-function getEquallySpacedPositions(startPosition, endPosition, amount) {
+function getEquallySpacedPositions(startPosition, endPosition, amount, y) {
     if (amount <= 0) {
         return [];
     }
@@ -167,7 +223,7 @@ function getEquallySpacedPositions(startPosition, endPosition, amount) {
     if (amount === 1) {
         return [{
             x: (startPosition.x + endPosition.x) / 2,
-            y: (startPosition.y + endPosition.y) / 2
+            y: y ?? (startPosition.y + endPosition.y) / 2
         }];
     }
 
@@ -179,7 +235,7 @@ function getEquallySpacedPositions(startPosition, endPosition, amount) {
     for (let index = 0; index < amount; index += 1) {
         positions.push({
             x: startPosition.x + xStep * index,
-            y: startPosition.y + yStep * index
+            y: y ?? startPosition.y + yStep * index
         });
     }
 
