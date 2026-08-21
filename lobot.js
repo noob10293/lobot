@@ -1,4 +1,7 @@
 const commandstate = new Map();
+const frontlineReplacementDistance = 100;
+const infantryCatchupDistance = 100;
+const orgtoreplace=0.6
 
 function onBotPlay(game, playerNumber) {
     // INITS
@@ -30,16 +33,20 @@ function onBotPlay(game, playerNumber) {
 
 
 
-    turnSubmission.formationChanges.push(...infantryFormationChanges(myinf, visibleEnemyUnits));
     const playerValues = initplayervalues(game, playerNumber);
     turnSubmission.orders.push(...infcommander(game, myinf, playerValues));
+    turnSubmission.formationChanges.push(...infantryFormationChanges(
+        myinf,
+        visibleEnemyUnits,
+        commandstate.get("reserveIds")
+    ));
 
 
 
     return turnSubmission;
 }
 
-function infantryFormationChanges(infantry, visibleEnemyUnits) {
+function infantryFormationChanges(infantry, visibleEnemyUnits, reserveIds = new Set()) {
     const formationChanges = [];
     const readyInfantry = infantry.filter(unit => !unit.isRoutingOrRecovering());
 
@@ -49,7 +56,7 @@ function infantryFormationChanges(infantry, visibleEnemyUnits) {
             const distanceToEnemy = unit.position.distanceTo(enemy.position);
             return distanceToEnemy <= unit.getMaxRange() * multi;
         });
-        const formationId = enemyWithinRange ? "line" : "column";
+        const formationId = reserveIds.has(unit.id) || !enemyWithinRange ? "column" : "line";
 
         if (unit.effectiveFormation === formationId) {
             continue;
@@ -91,7 +98,8 @@ function infcommander(game, infantry, playerValues) {
             infantry,
             lcentpos,
             rcentpos,
-            frontamt
+            frontamt,
+            lineWidth
         );
     }
     if (mostinfinposition(readyInfantry)) {
@@ -102,7 +110,46 @@ function infcommander(game, infantry, playerValues) {
     const stagingpositions=commandstate.get("stagingpositions");
     const phase = commandstate.get("phase");
 
-    
+        const roles = updateinfantryroles(
+            readyInfantry,
+            frontamt,
+            frontlineReplacementDistance
+        );
+    const unitsById = new Map(readyInfantry.map(unit => [unit.id, unit]));
+    roles.reserveAssignments.forEach((frontlineId, reserveId) => {
+            orders.push({
+                type: 1,
+                id: reserveId,
+                targetId: frontlineId
+            });
+        });
+    // roles.reserveAssignments.forEach((frontlineId, reserveId) => {
+    //     const frontPosition = unitsById.get(frontlineId).position;
+    //     console.log(frontPosition);
+    //     const reservePosition = getreserveposition(
+    //         frontPosition,
+    //         oglineY,
+    //         lineWidth
+    //     );
+    //     orders.push({
+    //         type: 4,
+    //         id: reserveId,
+    //         path: [[reservePosition.x, reservePosition.y]],
+    //         rotation: playerValues.get("rotationtoenemy")
+    //     });
+    // });
+    roles.withdrawalIds.forEach(unitId => {
+        const unit = unitsById.get(unitId);
+        const withdrawalPosition = getwithdrawalposition(unit, oglineY);
+        orders.push({
+            type: 6,
+            id: unitId,
+            path: [[withdrawalPosition.x, withdrawalPosition.y]],
+            rotation: playerValues.get("rotationtoenemy")
+        });
+    });
+    console.log(commandstate,roles)
+
     if (phase === "staging") {
         readyInfantry.slice(0, frontamt).forEach((unit, index) => {
             const position = stagingpositions[index];
@@ -114,26 +161,36 @@ function infcommander(game, infantry, playerValues) {
             });
         });
     } else if (phase === "attack") {
-        const positions = getEquallySpacedPositions(
+        const frontlineY = getfrontliney(
+            readyInfantry,
+            oglineY,
+            playerValues.get("mapfarthesty"),
+            infantryCatchupDistance
+        );
+        const positions = getequallyspacedtightpositions(
             lcentpos,
             rcentpos,
+            lineWidth,
             frontamt,
-            playerValues.get("mapfarthesty")
+            frontlineY
         );
 
-        readyInfantry.slice(0, frontamt).forEach((unit, index) => {
-            const position = positions[index];
+        const positionByFrontId = new Map(
+            roles.frontlineIds.map((unitId, index) => [unitId, positions[index]])
+        );
+
+        roles.frontlineIds.forEach(unitId => {
+            const position = positionByFrontId.get(unitId);
             orders.push({
                 type: 4, // FAA
-                id: unit.id,
+                id: unitId,
                 path: [[position.x, position.y]],
                 rotation: playerValues.get("rotationtoenemy")
             });
         });
-        
     }
 
-    // ignore reserves for now
+
     // readyInfantry.slice(lineCount).forEach((unit, index) => {
     //     const linePosition = linePositions[index % linePositions.length];
     //     const reserveRow = Math.floor(index / linePositions.length) + 1;
@@ -148,12 +205,13 @@ function infcommander(game, infantry, playerValues) {
     return orders;
 }
 
-function initializecommandstate(infantry, lcentpos, rcentpos, frontamt) {
+function initializecommandstate(infantry, lcentpos, rcentpos, frontamt, spacing) {
     const oglineY = infantry.reduce((total, unit) => total + unit.position.y, 0) / infantry.length;
     const stagingY = (oglineY + lcentpos.y) / 2;
-    const stagingpositions = getEquallySpacedPositions(
+    const stagingpositions = getequallyspacedtightpositions(
         lcentpos,
         rcentpos,
+        spacing,
         frontamt,
         stagingY
     );
@@ -163,7 +221,8 @@ function initializecommandstate(infantry, lcentpos, rcentpos, frontamt) {
     commandstate.set("phase", "staging");
 }
 
-function mostinfinposition(infantry,threshold=10,percent=1) {
+// for threshold its the max distance u can be away from the staging position to count, for percent 1 is all, 0.5 is half, 0.25 is quarter, etc.
+function mostinfinposition(infantry,threshold=2,percent=1) {
     const positions=commandstate.get("stagingpositions");
     const infantryToCheck = infantry.slice(0, positions.length);
     const inPositionCount = infantryToCheck.filter((unit, index) => {
@@ -171,6 +230,140 @@ function mostinfinposition(infantry,threshold=10,percent=1) {
     }).length;
 
     return inPositionCount / infantryToCheck.length >= percent;
+}
+
+function getfrontliney(infantry, oglineY, mapfarthesty, catchupDistance) {
+    const yValues = infantry.map(unit => unit.position.y);
+    const furthestY = mapfarthesty < oglineY ? Math.min(...yValues) : Math.max(...yValues);
+    const furthestBehindY = mapfarthesty < oglineY ? Math.max(...yValues) : Math.min(...yValues);
+    const distanceBetweenInfantry = Math.abs(furthestBehindY - furthestY);
+
+    return distanceBetweenInfantry > catchupDistance ? furthestY : mapfarthesty;
+}
+
+function updateinfantryroles(readyInfantry, frontamt, replacementDistance) {
+    const unitsById = new Map(readyInfantry.map(unit => [unit.id, unit]));
+    let frontlineIds = commandstate.get("frontlineIds");
+    let reserveAssignments = commandstate.get("reserveAssignments");
+    const withdrawalIds = new Set();
+
+    if (!frontlineIds) {
+        frontlineIds = readyInfantry.slice(0, frontamt).map(unit => unit.id);
+        reserveAssignments = assignreserveinfantry(
+            readyInfantry.filter(unit => !frontlineIds.includes(unit.id)),
+            frontlineIds
+        );
+    }
+    reserveAssignments = reserveAssignments || new Map();
+
+    const promotedReserveIds = new Set();
+    frontlineIds = frontlineIds.map(frontlineId => {
+        const frontlineUnit = unitsById.get(frontlineId);
+        let reserveId;
+
+        if (frontlineUnit) {
+            for (const reserveUnitId of reserveAssignments.keys()) {
+                const reserveUnit = unitsById.get(reserveUnitId);
+                const reserveCanReplace = reserveUnit &&
+                    !promotedReserveIds.has(reserveUnitId) &&
+                    reserveUnit.position.distanceTo(frontlineUnit.position) <= replacementDistance;
+
+                if (reserveCanReplace) {
+                    reserveId = reserveUnitId;
+                    break;
+                }
+            }
+        }
+
+        if (frontlineUnit && reserveId && frontlineUnit.org < frontlineUnit.maxOrg * orgtoreplace) {
+            promotedReserveIds.add(reserveId);
+            withdrawalIds.add(frontlineId);
+            return reserveId;
+        }
+
+        return frontlineId;
+    });
+
+    const reserveIds = readyInfantry
+        .filter(unit => !frontlineIds.includes(unit.id) && !withdrawalIds.has(unit.id))
+        .map(unit => unit.id);
+    reserveAssignments = assignreserveinfantry(
+        reserveIds.map(unitId => unitsById.get(unitId)),
+        frontlineIds
+    );
+
+    commandstate.set("frontlineIds", frontlineIds);
+    commandstate.set("reserveIds", new Set(reserveIds));
+    commandstate.set("reserveAssignments", reserveAssignments);
+    commandstate.set("withdrawalIds", withdrawalIds);
+
+    return {
+        frontlineIds,
+        reserveAssignments,
+        withdrawalIds
+    };
+}
+
+function assignreserveinfantry(reserveInfantry, frontlineIds) {
+    const assignments = new Map();
+    const reserveCount = reserveInfantry.length;
+    const frontlineCount = frontlineIds.length;
+    const usedFrontlineIndexes = new Set();
+    const firstInteriorIndex = frontlineCount > 2 ? 1 : 0;
+    const lastInteriorIndex = frontlineCount > 2 ? frontlineCount - 2 : frontlineCount - 1;
+    const candidateIndexes = [];
+
+    for (let index = firstInteriorIndex; index <= lastInteriorIndex; index += 1) {
+        candidateIndexes.push(index);
+    }
+
+    for (let index = 0; index < frontlineCount; index += 1) {
+        if (!candidateIndexes.includes(index)) {
+            candidateIndexes.push(index);
+        }
+    }
+
+    reserveInfantry.forEach((unit, index) => {
+        const preferredIndex = Math.round(
+            (index + 1) * frontlineCount / (reserveCount + 1)
+        );
+        let followedIndex;
+        let closestDistance;
+
+        candidateIndexes.forEach(candidateIndex => {
+            if (usedFrontlineIndexes.has(candidateIndex)) {
+                return;
+            }
+
+            const distance = Math.abs(candidateIndex - preferredIndex);
+            if (closestDistance === undefined || distance < closestDistance) {
+                followedIndex = candidateIndex;
+                closestDistance = distance;
+            }
+        });
+
+        if (followedIndex !== undefined) {
+            usedFrontlineIndexes.add(followedIndex);
+            assignments.set(unit.id, frontlineIds[followedIndex]);
+        }
+    });
+
+    return assignments;
+}
+
+// function getreserveposition(frontPosition, oglineY, lineWidth) {
+//     const behindDirection = oglineY >= frontPosition.y ? 1 : -1;
+//     return {
+//         x: frontPosition.x,
+//         y: frontPosition.y + behindDirection * lineWidth * 2
+//     };
+// }
+
+function getwithdrawalposition(unit, oglineY) {
+    return {
+        x: unit.position.x,
+        y: oglineY
+    };
 }
 
 function getlineinfo(readyInfantry) {
@@ -236,6 +429,25 @@ function getEquallySpacedPositions(startPosition, endPosition, amount, y) {
         positions.push({
             x: startPosition.x + xStep * index,
             y: y ?? startPosition.y + yStep * index
+        });
+    }
+
+    return positions;
+}
+
+function getequallyspacedtightpositions(startPosition, endPosition, spacing, amount, y) {
+    if (amount <= 0) {
+        return [];
+    }
+
+    const centerX = (startPosition.x + endPosition.x) / 2;
+    const firstX = centerX - spacing * (amount - 1) / 2;
+    const positions = [];
+
+    for (let index = 0; index < amount; index += 1) {
+        positions.push({
+            x: firstX + spacing * index,
+            y
         });
     }
 
