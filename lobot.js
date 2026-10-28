@@ -1,524 +1,677 @@
-const commandstate = new Map();
-const frontlineReplacementDistance = 100;
-const infantryCatchupDistance = 50;
-const reserveLineChangeDistance = 100;
-const centerObjectiveRowTolerance = 50;
-const centerObjectiveMaxDistanceRatio = 0.15;
-const orgtoreplace=0.7
+const botStates = new Map();
+const infantryCategories = ["infantry", "guardsInfantry", "militiaInfantry"];
+const cavalryCategories = ["scoutCavalry", "lightCavalry", "midCavalry", "heavyCavalry"];
+const engagementRange = 200;
+const mopUpPowerDifference = 0.1;
+const useDeploymentTest = false;
 
 function onBotPlay(game, playerNumber) {
-    // INITS
-    const allUnits = game.getUnits();
-    const turnSubmission = { orders: [], autofireConfigChanges: [], formationChanges: [] };
+    if (useDeploymentTest) {
+        return onBotPlayDeploymentTest(game, playerNumber);
+    }
 
-
-
-    // LOGS
-    // console.log("Unit categories:", allUnits.map(unit => ({
-    //   id: unit.id,
-    //   player: unit.player,
-    //   category: unit.category
-    // })));
-    console.log(game)
-    const visibleEnemyUnits = game.getVisibleEnemyUnits(playerNumber);
-    console.log("Visible enemy units:", visibleEnemyUnits.map(unit => ({ id: unit.id, category: unit.category, x: unit.position.x, y: unit.position.y })));
-
-
-
-    // UNITS
-    const myUnits = allUnits.filter(unit => unit.player === playerNumber);
-    const enemyUnits = allUnits.filter(unit => unit.team !== game.getPlayerTeam(playerNumber));
-    // Group units by their battlefield category.
-    const mycav = myUnits.filter(unit => ["scoutCavalry", "lightCavalry", "midCavalry", "heavyCavalry"].includes(unit.category));
-    const myarty = myUnits.filter(unit => unit.category === "artillery");
-    const myinf = myUnits.filter(unit => ["infantry", "guardsInfantry", "militiaInfantry"].includes(unit.category));
-    const myskirms = myUnits.filter(unit => unit.category === "skirmishInfantry");
-
-
-
-    const playerValues = initplayervalues(game, playerNumber);
-    turnSubmission.orders.push(...infcommander(game, myinf, playerValues));
-    turnSubmission.orders.push(...skirmcommander(game, myskirms, myinf, playerValues));
-    turnSubmission.formationChanges.push(...infantryFormationChanges(
-        myinf,
-        visibleEnemyUnits,
-        commandstate.get("reserveIds"),
-        commandstate.get("reserveAssignments")
-    ));
-
-
-
-    return turnSubmission;
+    return onBotPlayLine(game, playerNumber);
 }
 
-function skirmcommander(game, skirmishers, infantry, playerValues) {
-    const readySkirmishers = skirmishers.filter(unit => !unit.isRoutingOrRecovering());
-    const tileSize = game.map.width / game.map.terrains.length;
-    const mapCenter = { x: game.map.width / 2, y: game.map.height / 2 };
-    const frontlineIds = commandstate.get("frontlineIds") || [];
-    const frontlineInfantry = infantry.filter(unit => frontlineIds.includes(unit.id));
-    const averageLineY = frontlineInfantry.reduce((total, unit) => total + unit.position.y, 0) / frontlineInfantry.length;
-    const enemyIsAbove = playerValues.get("mapfarthesty") < mapCenter.y;
-    const coverTerrainIds = new Set([1, 2, 12, 13]);
-    const coverPositions = [];
+function onBotPlayDeploymentTest(game, playerNumber) {
+    const submission = { orders: [], autofireConfigChanges: [], formationChanges: [] };
 
-    game.map.terrains.forEach((column, tileX) => {
-        column.forEach((terrainId, tileY) => {
-            const position = { x: (tileX + 0.5) * tileSize, y: (tileY + 0.5) * tileSize };
-            const terrainOnFriendlySide = enemyIsAbove ? position.y >= mapCenter.y : position.y <= mapCenter.y;
-            const terrainAheadOfLine = enemyIsAbove ? position.y <= averageLineY : position.y >= averageLineY;
-            if (coverTerrainIds.has(terrainId) && terrainOnFriendlySide && terrainAheadOfLine) {
-                coverPositions.push({
-                    position,
-                    centerDistance: Math.hypot(position.x - mapCenter.x, position.y - mapCenter.y)
+    if (game.turnNumber === 0) {
+        game.getUnits()
+            .filter(unit => unit.player === playerNumber)
+            .forEach(unit => {
+                submission.orders.push({
+                    type: 5,
+                    id: unit.id,
+                    pos: [unit.position.x + 10, unit.position.y],
+                    rotation: unit.rotation
+                });
+            });
+    }
+
+    return submission;
+}
+
+function onBotPlayLine(game, playerNumber) {
+    const friendlyUnits = game.getUnits().filter(unit => unit.player === playerNumber);
+    const visibleEnemies = game.getVisibleEnemyUnits(playerNumber);
+    const stateKey = String(game.id) + ":" + playerNumber;
+    let state = botStates.get(stateKey);
+
+    if (!state) {
+        state = createLineState(friendlyUnits);
+        botStates.set(stateKey, state);
+    }
+
+    const submission = { orders: [], autofireConfigChanges: [], formationChanges: [] };
+    const teamZones = game.map.deploymentZones.find(entry => entry.team === game.getPlayerTeam(playerNumber)).zones;
+    const mainZone = teamZones.find(zone => zone.type === "main");
+    const zoneBounds = getZoneBounds(mainZone, game.map);
+    const faceEnemy = playerNumber === 1 ? 3 * Math.PI / 2 : Math.PI / 2;
+
+    if (!state.deployed && game.turnNumber === 0) {
+        submission.orders.push(...deployLine(state, friendlyUnits, playerNumber));
+        submission.formationChanges.push(...getFormationChanges(state, friendlyUnits, visibleEnemies, true));
+        state.staged = true;
+        state.deployed = true;
+        return submission;
+    }
+
+    if (!state.staged) {
+        submission.orders.push(...stageLine(state, friendlyUnits, zoneBounds || { x: 0, y: game.map.height * 0.25, width: game.map.width, height: game.map.height * 0.5 }, playerNumber));
+        submission.formationChanges.push(...getFormationChanges(state, friendlyUnits, visibleEnemies, true));
+        state.staged = true;
+        return submission;
+    }
+
+    const unitsById = new Map(friendlyUnits.map(unit => [unit.id, unit]));
+    const activeLine = promoteFollowers(state, unitsById);
+    const artilleryOrders = new Map();
+    const responsiveFollowers = [];
+    const followerOrders = [];
+
+    for (const slot of state.lineSlots) {
+        if (slot.kind === "artillery") {
+            const artillery = unitsById.get(slot.unitId);
+            if (artillery && !artillery.isRoutingOrRecovering()) {
+                const enemyWithinAdvanceRange = visibleEnemies.some(enemy => artillery.position.distanceTo(enemy.position) <= engagementRange);
+                artilleryOrders.set(artillery.id, enemyWithinAdvanceRange ? 4 : 2);
+                activeLine.push({ unit: artillery, slot, x: artillery.position.x, kind: "artillery" });
+            }
+
+            const artilleryUnavailable = !artillery || artillery.hp <= 0 || artillery.isRoutingOrRecovering();
+            const followers = state.followersByArtillery.get(slot.artilleryId) || [];
+            followers.forEach(followerId => {
+                const follower = unitsById.get(followerId);
+                if (follower && !follower.isRoutingOrRecovering()) {
+                    if (artilleryUnavailable) {
+                        responsiveFollowers.push({ unit: follower, x: follower.position.x, kind: "infantry" });
+                    } else {
+                        const followerIsAhead = (playerNumber === 1 ? -1 : 1) * follower.position.y > (playerNumber === 1 ? -1 : 1) * artillery.position.y;
+                        followerOrders.push({ type: followerIsAhead ? 6 : 1, id: follower.id, targetId: artillery.id });
+                    }
+                }
+            });
+        } else {
+            const unit = unitsById.get(slot.unitId);
+            if (unit && !unit.isRoutingOrRecovering()) {
+                activeLine.push({ unit, slot, x: unit.position.x, kind: "infantry" });
+                const followers = state.followersByArtillery.get(slot.artilleryId) || [];
+                followers.forEach(followerId => {
+                    const follower = unitsById.get(followerId);
+                    if (follower && !follower.isRoutingOrRecovering()) {
+                        followerOrders.push({ type: 1, id: follower.id, targetId: unit.id });
+                    }
                 });
             }
-        });
+        }
+    }
+
+    state.reserveIds.forEach(unitId => {
+        const unit = unitsById.get(unitId);
+        if (unit && infantryCategories.includes(unit.category) && !unit.isRoutingOrRecovering()) {
+            activeLine.push({ unit, slot: null, x: unit.position.x, kind: "infantry" });
+        }
     });
 
-    coverPositions.sort((a, b) => a.centerDistance - b.centerDistance);
+    activeLine.push(...responsiveFollowers);
+    const activeWithOrders = activeLine.map(record => {
+        const order = artilleryOrders.get(record.unit.id) || 1;
+        const reachOrder = order === 2 ? 2 : 1;
+        const reach = game.getMovementReach(record.unit, { order: reachOrder, direction: faceEnemy });
+        return { ...record, order, reach, progress: (playerNumber === 1 ? -1 : 1) * record.unit.position.y };
+    });
+    const followerIds = new Set();
+    state.followersByArtillery.forEach(ids => ids.forEach(id => followerIds.add(id)));
+    const movementLimitUnits = activeWithOrders.filter(record => !followerIds.has(record.unit.id));
+    const mapEdgeProgress = (playerNumber === 1 ? -1 : 1) * (playerNumber === 1 ? 5 : game.map.height - 5);
+    const slowestReachProgress = Math.min(...movementLimitUnits.map(record => (playerNumber === 1 ? -1 : 1) * record.reach.position.y));
+    const targetProgress = Math.min(slowestReachProgress + 10, mapEdgeProgress);
+    const targetY = (playerNumber === 1 ? -1 : 1) * targetProgress;
 
-    return readySkirmishers.slice(0, coverPositions.length).map((unit, index) => ({
-        type: 2,
-        id: unit.id,
-        path: [[coverPositions[index].position.x, coverPositions[index].position.y]]
-    }));
+    if (!state.mopUp && getPowerLostDifference(game, playerNumber) > mopUpPowerDifference) {
+        state.mopUp = true;
+    }
+
+    if (state.mopUp) {
+        submission.orders.push(...getMopUpOrders(game, friendlyUnits, visibleEnemies, playerNumber));
+        submission.orders.push(...getCavalryOrders(game, state, unitsById, visibleEnemies, playerNumber, faceEnemy, targetProgress, targetY));
+        submission.formationChanges.push(...getFormationChanges(state, friendlyUnits, visibleEnemies, false));
+        return submission;
+    }
+
+    submission.orders.push(...followerOrders);
+    activeWithOrders.forEach(record => {
+        const orderType = record.kind === "artillery" ? record.order : 4;
+        const destinationY = record.progress >= targetProgress ? record.unit.position.y : targetY;
+        submission.orders.push({
+            type: orderType,
+            id: record.unit.id,
+            path: [[record.x, destinationY]],
+            rotation: faceEnemy
+        });
+    });
+    const movementByUnitId = new Map(activeWithOrders.map(record => [record.unit.id, record]));
+    state.skirmishByTarget.forEach((skirmisherIds, targetId) => {
+        const targetRecord = movementByUnitId.get(targetId);
+        if (targetRecord) {
+            const skirmishTarget = getForwardPosition(targetRecord.reach.position, 25, playerNumber);
+            skirmisherIds.forEach(skirmisherId => {
+                const skirmisher = unitsById.get(skirmisherId);
+                if (skirmisher && !skirmisher.isRoutingOrRecovering()) {
+                    submission.orders.push({
+                        type: 4,
+                        id: skirmisher.id,
+                        path: [[skirmishTarget.x, skirmishTarget.y]],
+                        rotation: faceEnemy
+                    });
+                }
+            });
+        }
+    });
+    submission.orders.push(...getCavalryOrders(game, state, unitsById, visibleEnemies, playerNumber, faceEnemy, targetProgress, targetY));
+    submission.formationChanges.push(...getFormationChanges(state, friendlyUnits, visibleEnemies, false));
+    return submission;
 }
 
-function infantryFormationChanges(infantry, visibleEnemyUnits, reserveIds = new Set(), reserveAssignments = new Map()) {
-    const formationChanges = [];
-    const readyInfantry = infantry.filter(unit => !unit.isRoutingOrRecovering());
-    const unitsById = new Map(readyInfantry.map(unit => [unit.id, unit]));
+function getPowerLostDifference(game, playerNumber) {
+    const botTeam = game.getPlayerTeam(playerNumber);
+    const teamStats = game.vpService.getTeamsVictoryStats();
+    const botStats = teamStats.find(record => record.team === botTeam);
+    const enemyStats = teamStats.find(record => record.team !== botTeam);
+    const botPowerLost = 1 - botStats.currentArmyPower / botStats.initialArmyPower;
+    const enemyPowerLost = 1 - enemyStats.currentArmyPower / enemyStats.initialArmyPower;
+    return enemyPowerLost - botPowerLost;
+}
 
-    for (const unit of readyInfantry) {
-        const multi=3;
-        const enemyWithinRange = visibleEnemyUnits.some(enemy => {
-            const distanceToEnemy = unit.position.distanceTo(enemy.position);
-            return distanceToEnemy <= unit.getMaxRange() * multi;
+function getMopUpOrders(game, friendlyUnits, visibleEnemies, playerNumber) {
+    const botTeam = game.getPlayerTeam(playerNumber);
+    const enemyObjectives = game.getObjectives().filter(objective => objective.team !== undefined && objective.team !== botTeam);
+    const mopUpRecords = friendlyUnits
+        .filter(unit => (unit.category === "artillery" || unit.category === "skirmishInfantry" || infantryCategories.includes(unit.category)) && !unit.isRoutingOrRecovering())
+        .map(unit => {
+            const kind = unit.category === "artillery" ? "artillery" : unit.category === "skirmishInfantry" ? "skirmish" : "infantry";
+            const enemyTargets = visibleEnemies
+                .filter(enemy => isValidMopUpEnemyTarget(game, unit, enemy, visibleEnemies))
+                .map(enemy => ({ target: enemy, distance: unit.position.distanceTo(enemy.position) }));
+            const objectiveTargets = kind === "infantry"
+                ? enemyObjectives.map(objective => ({ target: objective, distance: unit.position.distanceTo(objective.position) }))
+                : [];
+            return {
+                unit,
+                kind,
+                candidates: [...enemyTargets, ...objectiveTargets].sort((left, right) => left.distance - right.distance)
+            };
         });
-        const assignedFrontlineId = reserveAssignments.get(unit.id);
-        const assignedFrontlineUnit = unitsById.get(assignedFrontlineId);
-        const assignedFrontlineNearEnemy = assignedFrontlineUnit && visibleEnemyUnits.some(enemy => assignedFrontlineUnit.position.distanceTo(enemy.position) <= reserveLineChangeDistance);
-        const formationId = reserveIds.has(unit.id) ? assignedFrontlineNearEnemy ? "line" : "column" : enemyWithinRange ? "line" : "column";
+    const claims = { infantry: new Set(), artillery: new Set(), skirmish: new Set() };
+    const assignments = new Map();
+    const unassignedUnitIds = new Set(mopUpRecords.map(record => record.unit.id));
 
-        if (unit.effectiveFormation === formationId) {
-            continue;
+    while (unassignedUnitIds.size) {
+        let closestPair;
+        mopUpRecords.forEach(record => {
+            if (!unassignedUnitIds.has(record.unit.id)) {
+                return;
+            }
+            const nextTarget = record.candidates.find(entry => !isMopUpTargetClaimed(record.kind, entry.target.id, claims));
+            if (nextTarget && (!closestPair || nextTarget.distance < closestPair.entry.distance)) {
+                closestPair = { record, entry: nextTarget };
+            }
+        });
+        if (!closestPair) {
+            break;
+        }
+        assignments.set(closestPair.record.unit.id, closestPair.entry);
+        claims[closestPair.record.kind].add(closestPair.entry.target.id);
+        unassignedUnitIds.delete(closestPair.record.unit.id);
+    }
+
+    return mopUpRecords.flatMap(record => {
+        const assignment = assignments.get(record.unit.id);
+        if (!assignment) {
+            return [];
+        }
+        const direction = assignment.target.position.subtract(record.unit.position).angle();
+        return [{
+            type: 4,
+            id: record.unit.id,
+            path: [[assignment.target.position.x, assignment.target.position.y]],
+            rotation: direction
+        }];
+    });
+}
+
+function isValidMopUpEnemyTarget(game, unit, enemy, visibleEnemies) {
+    return !enemy.isRouting();
+}
+
+function isMopUpTargetClaimed(kind, targetId, claims) {
+    if (kind === "infantry") {
+        return claims.infantry.has(targetId) || claims.artillery.has(targetId);
+    }
+    if (kind === "artillery") {
+        return claims.infantry.has(targetId) || claims.artillery.has(targetId);
+    }
+    return claims.skirmish.has(targetId);
+}
+
+function getCavalryOrders(game, state, unitsById, visibleEnemies, playerNumber, faceEnemy, targetProgress, targetY) {
+    const cavalryRecords = state.cavalryIds
+        .map(cavalryId => unitsById.get(cavalryId))
+        .filter(cavalry => cavalry && !cavalry.isRoutingOrRecovering())
+        .map(cavalry => {
+            const reachableEnemies = visibleEnemies
+                .filter(enemy => !enemy.isRouting())
+                .map(enemy => {
+                    const toEnemy = enemy.position.subtract(cavalry.position);
+                    const reach = game.getMovementReach(cavalry, { order: 2, direction: toEnemy.angle() });
+                    return { enemy, distance: toEnemy.length(), reach };
+                })
+                .filter(entry => !entry.reach.blocked && entry.distance <= entry.reach.distance)
+                .sort((left, right) => left.distance - right.distance);
+            return {
+                cavalry,
+                reachableEnemies,
+                validTargets: reachableEnemies.filter(entry => isValidCavalryTarget(game, cavalry, entry.enemy, visibleEnemies))
+            };
+        });
+    const assignments = new Map();
+    const selectedTargetIds = new Set();
+    const unassignedCavalryIds = new Set(cavalryRecords.map(record => record.cavalry.id));
+
+    while (unassignedCavalryIds.size) {
+        let closestPair;
+        cavalryRecords.forEach(record => {
+            if (!unassignedCavalryIds.has(record.cavalry.id)) {
+                return;
+            }
+            const closestEnemy = record.reachableEnemies[0];
+            if (closestEnemy && isCavalryFallbackTarget(closestEnemy.enemy) && !isValidCavalryTarget(game, record.cavalry, closestEnemy.enemy, visibleEnemies)) {
+                return;
+            }
+            const nextTarget = record.validTargets.find(entry => !selectedTargetIds.has(entry.enemy.id));
+            if (nextTarget && (!closestPair || nextTarget.distance < closestPair.entry.distance)) {
+                closestPair = { record, entry: nextTarget };
+            }
+        });
+        if (!closestPair) {
+            break;
+        }
+        assignments.set(closestPair.record.cavalry.id, closestPair.entry.enemy.id);
+        selectedTargetIds.add(closestPair.entry.enemy.id);
+        unassignedCavalryIds.delete(closestPair.record.cavalry.id);
+    }
+
+    return cavalryRecords.map(record => {
+        const closestEnemy = record.reachableEnemies[0];
+        if (closestEnemy && isCavalryFallbackTarget(closestEnemy.enemy) && !isValidCavalryTarget(game, record.cavalry, closestEnemy.enemy, visibleEnemies)) {
+            const awayDirection = record.cavalry.position.subtract(closestEnemy.enemy.position).angle();
+            const fallbackReach = game.getMovementReach(record.cavalry, { order: 6, direction: awayDirection });
+            return {
+                type: 6,
+                id: record.cavalry.id,
+                path: [[fallbackReach.position.x, fallbackReach.position.y]],
+                rotation: awayDirection
+            };
+        }
+        const targetId = assignments.get(record.cavalry.id);
+        if (targetId !== undefined) {
+            return { type: 2, id: record.cavalry.id, targetId };
         }
 
-        formationChanges.push({ unitId: unit.id, formationId });
+        const progress = (playerNumber === 1 ? -1 : 1) * record.cavalry.position.y;
+        const destinationY = progress >= targetProgress ? record.cavalry.position.y : targetY;
+        return { type: 1, id: record.cavalry.id, path: [[record.cavalry.position.x, destinationY]], rotation: faceEnemy };
+    });
+}
+
+function isValidCavalryTarget(game, cavalry, enemy, visibleEnemies) {
+    if (enemy.category === "skirmishInfantry" || cavalryCategories.includes(enemy.category)) {
+        if (cavalryCategories.includes(enemy.category)) {
+            return true;
+        }
+        return !isSkirmisherInCover(game, enemy) && !isSkirmisherScreened(cavalry, enemy, visibleEnemies);
     }
 
-    return formationChanges;
+    if (enemy.category === "artillery" || infantryCategories.includes(enemy.category)) {
+        return enemy.effectiveFormation !== "square" && (enemy.isRunning(2) || enemy.getOrgProportion() < 0.6 || isFacingAwayFromCavalry(cavalry, enemy));
+    }
+
+    return false;
 }
 
-function initplayervalues(game, playerNumber) {
-    const rotationtoenemy = playerNumber === 1 ? 3 * Math.PI / 2 : Math.PI / 2;
-    const mapfarthesty = playerNumber === 1 ? 0 : game.map.height;
-
-    return new Map([
-        ["rotationtoenemy", rotationtoenemy],
-        ["mapfarthesty", mapfarthesty]
-    ]);
+function isCavalryFallbackTarget(enemy) {
+    return enemy.category === "artillery" || infantryCategories.includes(enemy.category) || enemy.category === "skirmishInfantry";
 }
 
-function infcommander(game, infantry, playerValues) {
+function isSkirmisherInCover(game, enemy) {
+    const formation = enemy.gameDataManager.getFormationManager().getTemplate(enemy.currentFormation);
+    const checkPoints = formation && formation.checkPoints ? formation.checkPoints : [{ x: 0, y: 0, weight: 1 }];
+    const tileSize = enemy.gameDataManager.getGameConstants().TILE_SIZE;
+    let coveredWeight = 0;
+    let totalWeight = 0;
+    checkPoints.forEach(checkPoint => {
+        const cosTheta = Math.cos(-enemy.rotation);
+        const sinTheta = Math.sin(-enemy.rotation);
+        const point = {
+            x: enemy.position.x + checkPoint.x * cosTheta + checkPoint.y * sinTheta,
+            y: enemy.position.y + -checkPoint.x * sinTheta + checkPoint.y * cosTheta
+        };
+        if (!game.isPointOutsideMap(point)) {
+            const terrain = game.map.terrains[Math.floor(point.x / tileSize)][Math.floor(point.y / tileSize)];
+            totalWeight += checkPoint.weight;
+            if (terrain === 1 || terrain === 2 || terrain === 13) {
+                coveredWeight += checkPoint.weight;
+            }
+        }
+    });
+    return coveredWeight > totalWeight * 0.5;
+}
+
+function isSkirmisherScreened(cavalry, skirmisher, visibleEnemies) {
+    return visibleEnemies.some(enemy => {
+        const isScreeningUnit = enemy.category === "artillery" || infantryCategories.includes(enemy.category);
+        return !enemy.isRouting() && isScreeningUnit && skirmisher.position.distanceTo(enemy.position) <= 100 && !isValidCavalryTargetForScreen(cavalry, enemy);
+    });
+}
+
+function isValidCavalryTargetForScreen(cavalry, enemy) {
+    return enemy.effectiveFormation !== "square" && (enemy.isRunning(2) || enemy.getOrgProportion() < 0.6 || isFacingAwayFromCavalry(cavalry, enemy));
+}
+
+function isFacingAwayFromCavalry(cavalry, enemy) {
+    const directionToCavalry = cavalry.position.subtract(enemy.position).angle();
+    const angleDifference = Math.abs(Math.atan2(Math.sin(enemy.rotation - directionToCavalry), Math.cos(enemy.rotation - directionToCavalry)));
+    const requiredDifference = enemy.category === "artillery" ? Math.PI / 2 : 100 * Math.PI / 180;
+    return angleDifference >= requiredDifference;
+}
+
+function createLineState(friendlyUnits) {
+    const artillery = friendlyUnits.filter(unit => unit.category === "artillery");
+    const infantry = friendlyUnits.filter(unit => infantryCategories.includes(unit.category));
+    const lineInfantryCount = artillery.length ? Math.min(artillery.length, Math.max(0, infantry.length - artillery.length)) : infantry.length;
+    const lineInfantry = infantry.slice(0, lineInfantryCount);
+    const reserveInfantry = infantry.slice(lineInfantryCount, lineInfantryCount + artillery.length);
+    const state = { lineSlots: [], followersByArtillery: new Map(), skirmishByTarget: new Map(), cavalryIds: friendlyUnits.filter(unit => cavalryCategories.includes(unit.category)).map(unit => unit.id), deployed: false, staged: false, mopUp: false, reserveIds: new Set(), reserveLinePositions: new Map(), cavalryLinePositions: new Map() };
+    const pairCount = Math.max(artillery.length, lineInfantry.length);
+
+    for (let index = 0; index < pairCount; index += 1) {
+        if (artillery[index]) {
+            state.lineSlots.push({ unitId: artillery[index].id, artilleryId: artillery[index].id, kind: "artillery" });
+        }
+        if (lineInfantry[index]) {
+            state.lineSlots.push({ unitId: lineInfantry[index].id, kind: "infantry" });
+        }
+    }
+    state.lineSlots.forEach((slot, index) => {
+        slot.xRatio = (index + 0.5) / Math.max(1, state.lineSlots.length);
+    });
+
+    artillery.forEach(unit => state.followersByArtillery.set(unit.id, []));
+    reserveInfantry.forEach((unit, index) => {
+        if (artillery.length) {
+            state.followersByArtillery.get(artillery[index % artillery.length].id).push(unit.id);
+            state.reserveIds.add(unit.id);
+        }
+    });
+
+    const lineTargets = state.lineSlots
+        .map((slot, index) => ({ slot, index }))
+        .filter(record => record.slot.kind === "infantry")
+        .sort((left, right) => Math.abs(left.index - (state.lineSlots.length - 1) / 2) - Math.abs(right.index - (state.lineSlots.length - 1) / 2))
+        .map(record => record.slot.unitId);
+    const flankTargets = friendlyUnits
+        .filter(unit => infantryCategories.includes(unit.category) && !state.lineSlots.some(slot => slot.unitId === unit.id) && !state.reserveIds.has(unit.id))
+        .map(unit => unit.id);
+    const skirmishers = friendlyUnits.filter(unit => unit.category === "skirmishInfantry");
+    const skirmishTargets = [...artillery.map(unit => unit.id), ...lineTargets, ...flankTargets];
+    skirmishers.forEach((unit, index) => {
+        const targetId = skirmishTargets[index];
+        if (targetId !== undefined) {
+            state.skirmishByTarget.set(targetId, [unit.id]);
+        }
+    });
+
+    const assignedIds = new Set([...state.lineSlots.map(slot => slot.unitId), ...state.reserveIds]);
+    state.reserveIds = new Set(friendlyUnits.filter(unit => !assignedIds.has(unit.id)).map(unit => unit.id));
+    return state;
+}
+
+function deployLine(state, friendlyUnits, playerNumber) {
     const orders = [];
-    const ignoredCatchupIds = commandstate.get("ignoredCatchupIds") || new Set();
-    infantry.filter(unit => unit.isRoutingOrRecovering()).forEach(unit => ignoredCatchupIds.add(unit.id));
-    commandstate.set("ignoredCatchupIds", ignoredCatchupIds);
-    const readyInfantry = infantry.filter(unit => !unit.isRoutingOrRecovering());
-    if (readyInfantry.length === 0) {
-        return [];
-    }
+    const sign = playerNumber === 1 ? 1 : -1;
+    const lineUnits = friendlyUnits.filter(unit => state.lineSlots.some(slot => slot.unitId === unit.id));
+    const xValues = lineUnits.map(unit => unit.position.x);
+    const lineLeft = Math.min(...xValues);
+    const lineRight = Math.max(...xValues);
+    const lineY = lineUnits.reduce((total, unit) => total + unit.position.y, 0) / lineUnits.length;
+    const lineSpacing = (lineRight - lineLeft) / Math.max(1, state.lineSlots.length - 1);
+    const slotX = index => state.lineSlots.length === 1 ? (lineLeft + lineRight) / 2 : lineLeft + lineSpacing * index;
+    const deployedIds = new Set();
+    const lineDeploymentPositions = new Map();
 
-    const { lineWidth, lineFormation } = getlineinfo(readyInfantry);
-    const objectiveInfo = getobjectiveinfo(game);
-    if (!objectiveInfo) {
-        return [];
-    }
-    const { leftmostCenterObjective: lcentpos, rightmostCenterObjective: rcentpos } = objectiveInfo;
-    const frontamt=getAmountThatFits(lcentpos, rcentpos, lineWidth);
-    const rearamt=readyInfantry.length-frontamt;
+    state.lineSlots.forEach((slot, index) => {
+        const unit = friendlyUnits.find(candidate => candidate.id === slot.unitId);
+        const x = slotX(index);
+        orders.push({ type: 5, id: unit.id, pos: [x, lineY], rotation: playerNumber === 1 ? 3 * Math.PI / 2 : Math.PI / 2 });
+        deployedIds.add(unit.id);
+        lineDeploymentPositions.set(unit.id, { x, y: lineY });
+        slot.xRatio = (index + 0.5) / Math.max(1, state.lineSlots.length);
+    });
 
-    console.log(frontamt, rearamt,lineWidth,lineFormation, lcentpos, rcentpos,commandstate);
-    
-
-    if (!commandstate.has("phase")) {
-        initializecommandstate(
-            infantry,
-            lcentpos,
-            rcentpos,
-            frontamt,
-            lineWidth
-        );
-    }
-    const oglineY=commandstate.get("oglineY");
-    const stagingpositions=commandstate.get("stagingpositions");
-    let phase = commandstate.get("phase");
-
-    const roles = updateinfantryroles(
-        readyInfantry,
-        frontamt,
-        frontlineReplacementDistance,
-        phase
-    );
-    if (phase === "staging" && mostinfinposition(readyInfantry)) {
-        commandstate.set("phase", "attack");
-        phase = "attack";
-    }
-    const unitsById = new Map(readyInfantry.map(unit => [unit.id, unit]));
-    roles.reserveAssignments.forEach((frontlineId, reserveId) => {
-            orders.push({
-                type: 1,
-                id: reserveId,
-                targetId: frontlineId
-            });
-        });
-    // roles.reserveAssignments.forEach((frontlineId, reserveId) => {
-    //     const frontPosition = unitsById.get(frontlineId).position;
-    //     console.log(frontPosition);
-    //     const reservePosition = getreserveposition(
-    //         frontPosition,
-    //         oglineY,
-    //         lineWidth
-    //     );
-    //     orders.push({
-    //         type: 4,
-    //         id: reserveId,
-    //         path: [[reservePosition.x, reservePosition.y]],
-    //         rotation: playerValues.get("rotationtoenemy")
-    //     });
-    // });
-    roles.withdrawalIds.forEach(unitId => {
-        const unit = unitsById.get(unitId);
-        const withdrawalPosition = getwithdrawalposition(unit, oglineY);
-        orders.push({
-            type: 6,
-            id: unitId,
-            path: [[withdrawalPosition.x, withdrawalPosition.y]],
-            rotation: playerValues.get("rotationtoenemy")
+    state.followersByArtillery.forEach((followerIds, artilleryId) => {
+        const artillerySlotIndex = state.lineSlots.findIndex(slot => slot.artilleryId === artilleryId);
+        followerIds.forEach((followerId, followerIndex) => {
+            const follower = friendlyUnits.find(unit => unit.id === followerId);
+            const yOffset = sign * (20 + followerIndex * 5);
+            orders.push({ type: 5, id: follower.id, pos: [slotX(artillerySlotIndex), lineY + yOffset], rotation: playerNumber === 1 ? 3 * Math.PI / 2 : Math.PI / 2 });
+            deployedIds.add(follower.id);
         });
     });
-    console.log(commandstate,roles)
 
-    if (phase === "staging") {
-        roles.frontlineIds.forEach((unitId, index) => {
-            const position = stagingpositions[index];
-            if (unitsById.has(unitId)) {
-                orders.push({
-                    type: 4,
-                    id: unitId,
-                    path: [[position.x, position.y]],
-                    rotation: playerValues.get("rotationtoenemy")
-                });
-            }
+    const extensionSpacing = Math.max(10, lineSpacing);
+    Array.from(state.reserveIds).filter(unitId => {
+        const unit = friendlyUnits.find(candidate => candidate.id === unitId);
+        return unit && infantryCategories.includes(unit.category);
+    }).forEach((unitId, reserveIndex) => {
+        const side = reserveIndex % 2 === 0 ? -1 : 1;
+        const distance = (Math.floor(reserveIndex / 2) + 1) * extensionSpacing;
+        const x = side < 0 ? lineLeft - distance : lineRight + distance;
+        const unit = friendlyUnits.find(candidate => candidate.id === unitId);
+        if (unit && infantryCategories.includes(unit.category)) {
+            orders.push({ type: 5, id: unit.id, pos: [x, lineY], rotation: playerNumber === 1 ? 3 * Math.PI / 2 : Math.PI / 2 });
+            deployedIds.add(unit.id);
+            lineDeploymentPositions.set(unit.id, { x, y: lineY });
+            state.reserveLinePositions.set(unitId, x);
+        }
+    });
+
+    const lineCenter = (lineLeft + lineRight) / 2;
+    const leftReserveCount = [...state.reserveLinePositions.values()].filter(x => x < lineCenter).length;
+    const rightReserveCount = [...state.reserveLinePositions.values()].filter(x => x >= lineCenter).length;
+    let leftCavalryIndex = 0;
+    let rightCavalryIndex = 0;
+    state.cavalryIds.forEach((cavalryId, cavalryIndex) => {
+        const cavalry = friendlyUnits.find(unit => unit.id === cavalryId);
+        const onLeft = cavalryIndex % 2 === 0;
+        const sideIndex = onLeft ? leftCavalryIndex++ : rightCavalryIndex++;
+        const distance = (sideIndex + (onLeft ? leftReserveCount : rightReserveCount) + 1) * extensionSpacing;
+        const x = onLeft ? lineLeft - distance : lineRight + distance;
+        orders.push({ type: 5, id: cavalry.id, pos: [x, lineY], rotation: playerNumber === 1 ? 3 * Math.PI / 2 : Math.PI / 2 });
+        deployedIds.add(cavalry.id);
+        state.cavalryLinePositions.set(cavalryId, { x, y: lineY });
+    });
+
+    state.skirmishByTarget.forEach((skirmisherIds, targetId) => {
+        const targetPosition = lineDeploymentPositions.get(targetId) || friendlyUnits.find(unit => unit.id === targetId).position;
+        const skirmishPosition = getForwardPosition(targetPosition, 25, playerNumber);
+        skirmisherIds.forEach(skirmisherId => {
+            const skirmisher = friendlyUnits.find(unit => unit.id === skirmisherId);
+            orders.push({ type: 5, id: skirmisher.id, pos: [skirmishPosition.x, skirmishPosition.y], rotation: playerNumber === 1 ? 3 * Math.PI / 2 : Math.PI / 2 });
+            deployedIds.add(skirmisher.id);
         });
-    } else if (phase === "attack") {
-        const frontlineY = getfrontliney(
-            readyInfantry.filter(unit => !ignoredCatchupIds.has(unit.id)),
-            oglineY,
-            playerValues.get("mapfarthesty"),
-            infantryCatchupDistance
-        );
-        const positions = getequallyspacedtightpositions(
-            lcentpos,
-            rcentpos,
-            lineWidth,
-            roles.frontlineIds.length,
-            frontlineY
-        );
+    });
 
-        const positionByFrontId = new Map(
-            roles.frontlineIds.map((unitId, index) => [unitId, positions[index]])
-        );
-
-        roles.frontlineIds.forEach(unitId => {
-            const position = positionByFrontId.get(unitId);
-            orders.push({
-                type: 4, // FAA
-                id: unitId,
-                path: [[position.x, position.y]],
-                rotation: playerValues.get("rotationtoenemy")
-            });
-        });
-    }
-
-
-    // readyInfantry.slice(lineCount).forEach((unit, index) => {
-    //     const linePosition = linePositions[index % linePositions.length];
-    //     const reserveRow = Math.floor(index / linePositions.length) + 1;
-    //     const reserveY = linePlacement.lineY + behindDirection * reserveDepth * reserveRow;
-    //     orders.push({
-    //         type: 4, // FAA
-    //         id: unit.id,
-    //         path: [[linePosition.x, reserveY]]
-    //     });
-    // });
+    const otherUnits = friendlyUnits.filter(unit => !deployedIds.has(unit.id));
+    otherUnits.forEach((unit, index) => {
+        orders.push({ type: 5, id: unit.id, pos: [unit.position.x, unit.position.y], rotation: playerNumber === 1 ? 3 * Math.PI / 2 : Math.PI / 2 });
+    });
 
     return orders;
 }
 
-function initializecommandstate(infantry, lcentpos, rcentpos, frontamt, spacing) {
-    const oglineY = infantry.reduce((total, unit) => total + unit.position.y, 0) / infantry.length;
-    const stagingY = (oglineY + lcentpos.y) / 2;
-    const stagingpositions = getequallyspacedtightpositions(
-        lcentpos,
-        rcentpos,
-        spacing,
-        frontamt,
-        stagingY
-    );
-
-    commandstate.set("oglineY", oglineY);
-    commandstate.set("stagingpositions", stagingpositions);
-    commandstate.set("phase", "staging");
-}
-
-// for threshold its the max distance u can be away from the staging position to count, for percent 1 is all, 0.5 is half, 0.25 is quarter, etc.
-function mostinfinposition(infantry,threshold=5,percent=1) {
-    const positions=commandstate.get("stagingpositions");
-    const infantryToCheck = infantry.slice(0, positions.length);
-    const inPositionCount = infantryToCheck.filter((unit, index) => {
-        return unit.position.distanceTo(positions[index]) <= threshold;
-    }).length;
-
-    return inPositionCount / infantryToCheck.length >= percent;
-}
-
-function getfrontliney(infantry, oglineY, mapfarthesty, catchupDistance) {
-    const yValues = infantry.length ? infantry.map(unit => unit.position.y) : [mapfarthesty];
-    const furthestY = mapfarthesty < oglineY ? Math.min(...yValues) : Math.max(...yValues);
-    const furthestBehindY = mapfarthesty < oglineY ? Math.max(...yValues) : Math.min(...yValues);
-    const distanceBetweenInfantry = Math.abs(furthestBehindY - furthestY);
-
-    return distanceBetweenInfantry > catchupDistance ? furthestY : mapfarthesty;
-}
-
-function updateinfantryroles(readyInfantry, frontamt, replacementDistance, phase) {
-    const unitsById = new Map(readyInfantry.map(unit => [unit.id, unit]));
-    let frontlineIds = commandstate.get("frontlineIds");
-    const reserveAssignments = commandstate.get("reserveAssignments") || new Map();
-    const reserveIds = commandstate.get("reserveIds") || new Set();
-    const withdrawalAssignments = commandstate.get("withdrawalAssignments") || new Map();
-    const swappedLastTurnIds = commandstate.get("swappedLastTurnIds") || new Set();
-    const swappedThisTurnIds = new Set();
-
-    if (!frontlineIds && phase === "staging") {
-        frontlineIds = readyInfantry.slice(0, frontamt).map(unit => unit.id);
-        const reserveInfantry = readyInfantry.filter(unit => !frontlineIds.includes(unit.id));
-        assignreserveinfantry(
-            reserveInfantry,
-            frontlineIds.map(unitId => unitsById.get(unitId))
-        ).forEach((frontlineId, reserveId) => reserveAssignments.set(reserveId, frontlineId));
-        reserveInfantry.forEach(unit => reserveIds.add(unit.id));
-    }
-
-    withdrawalAssignments.forEach((frontlineId, withdrawingId) => {
-        withdrawalAssignments.delete(withdrawingId);
-        reserveAssignments.set(withdrawingId, frontlineId);
-        reserveIds.add(withdrawingId);
+function stageLine(state, friendlyUnits, zone, playerNumber) {
+    const orders = [];
+    const faceEnemy = playerNumber === 1 ? 3 * Math.PI / 2 : Math.PI / 2;
+    const frontY = zone.y + zone.height * (playerNumber === 1 ? 0.35 : 0.65);
+    state.lineSlots.forEach((slot, index) => {
+        const unit = friendlyUnits.find(candidate => candidate.id === slot.unitId);
+        if (unit && !unit.isRoutingOrRecovering()) {
+            orders.push({
+                type: slot.kind === "artillery" ? 2 : 1,
+                id: unit.id,
+                path: [[unit.position.x, frontY]],
+                rotation: faceEnemy
+            });
+        }
     });
 
-    frontlineIds = frontlineIds.map((frontlineId, frontlineIndex) => {
-        const frontlineUnit = unitsById.get(frontlineId);
-        let reserveId;
+    state.cavalryIds.forEach(cavalryId => {
+        const cavalry = friendlyUnits.find(unit => unit.id === cavalryId);
+        if (cavalry && !cavalry.isRoutingOrRecovering()) {
+            orders.push({ type: 1, id: cavalry.id, path: [[cavalry.position.x, frontY]], rotation: faceEnemy });
+        }
+    });
 
-        if (frontlineUnit) {
-            for (const [reserveUnitId, assignedFrontlineId] of reserveAssignments) {
-                const reserveUnit = unitsById.get(reserveUnitId);
-                const assignedFrontlineIndex = frontlineIds.indexOf(assignedFrontlineId);
-                const reserveCanCoverFrontline = assignedFrontlineIndex === frontlineIndex || reserveUnit && reserveUnit.effectiveFormation === "column" && Math.abs(assignedFrontlineIndex - frontlineIndex) === 1;
-                const reserveCanReplace = reserveUnit &&
-                    reserveCanCoverFrontline &&
-                    !swappedLastTurnIds.has(frontlineId) &&
-                    !swappedLastTurnIds.has(reserveUnitId) &&
-                    reserveUnit.position.distanceTo(frontlineUnit.position) <= replacementDistance;
+    state.followersByArtillery.forEach((followerIds, artilleryId) => {
+        followerIds.forEach(followerId => {
+            const follower = friendlyUnits.find(unit => unit.id === followerId);
+            const artillery = friendlyUnits.find(unit => unit.id === artilleryId);
+            if (follower && artillery && !follower.isRoutingOrRecovering()) {
+                const followerIsAhead = (playerNumber === 1 ? -1 : 1) * follower.position.y > (playerNumber === 1 ? -1 : 1) * artillery.position.y;
+                orders.push({ type: followerIsAhead ? 6 : 1, id: follower.id, targetId: artillery.id });
+            }
+        });
+    });
 
-                if (reserveCanReplace) {
-                    reserveId = reserveUnitId;
-                    break;
+    return orders;
+}
+
+function promoteFollowers(state, unitsById) {
+    const activeLine = [];
+    state.lineSlots.forEach(slot => {
+        if (slot.kind === "artillery") {
+            const artillery = unitsById.get(slot.unitId);
+            if (!artillery || artillery.hp <= 0) {
+                const followers = state.followersByArtillery.get(slot.artilleryId) || [];
+                const replacementId = followers.find(id => unitsById.has(id) && unitsById.get(id).hp > 0 && !unitsById.get(id).isRoutingOrRecovering());
+                if (replacementId) {
+                    slot.unitId = replacementId;
+                    slot.kind = "infantry";
+                    state.followersByArtillery.set(slot.artilleryId, followers.filter(id => id !== replacementId));
                 }
             }
         }
-
-        if (frontlineUnit && reserveId && frontlineUnit.org < frontlineUnit.maxOrg * orgtoreplace) {
-            reserveAssignments.delete(reserveId);
-            reserveIds.delete(reserveId);
-            withdrawalAssignments.set(frontlineId, reserveId);
-            swappedThisTurnIds.add(frontlineId);
-            swappedThisTurnIds.add(reserveId);
-            return reserveId;
-        }
-
-        return frontlineId;
     });
-
-    const withdrawalIds = new Set(withdrawalAssignments.keys());
-
-    commandstate.set("frontlineIds", frontlineIds);
-    commandstate.set("reserveIds", reserveIds);
-    commandstate.set("reserveAssignments", reserveAssignments);
-    commandstate.set("withdrawalIds", withdrawalIds);
-    commandstate.set("withdrawalAssignments", withdrawalAssignments);
-    commandstate.set("swappedLastTurnIds", swappedThisTurnIds);
-
-    return {
-        frontlineIds,
-        reserveAssignments,
-        withdrawalIds
-    };
+    return activeLine;
 }
 
-function assignreserveinfantry(reserveInfantry, frontlineInfantry) {
-    const assignments = new Map();
-    const assignmentCount = Math.min(reserveInfantry.length, frontlineInfantry.length);
-    const candidateIndexes = Array.from({ length: frontlineInfantry.length }, (_, index) => index);
-    const frontlineIndexes = [];
+function getLinePositions(state, zone) {
+    const spacing = zone.width / Math.max(1, state.lineSlots.length);
+    const positions = new Map();
+    state.lineSlots.forEach(slot => positions.set(slot, zone.x + zone.width * slot.xRatio));
+    positions.spacing = spacing;
+    return positions;
+}
 
-    for (let index = 0; index < assignmentCount; index += 1) {
-        const preferredIndex = Math.round((index + 1) * frontlineInfantry.length / (assignmentCount + 1));
-        const closestCandidateIndex = candidateIndexes.reduce((closestIndex, candidateIndex, currentIndex) => {
-            return Math.abs(candidateIndex - preferredIndex) < Math.abs(candidateIndexes[closestIndex] - preferredIndex) ? currentIndex : closestIndex;
-        }, 0);
+function getForwardPosition(position, distance, playerNumber) {
+    return { x: position.x, y: position.y + (playerNumber === 1 ? -1 : 1) * distance };
+}
 
-        frontlineIndexes.push(candidateIndexes.splice(closestCandidateIndex, 1)[0]);
+function getZonePoints(zone) {
+    const rawPoints = zone && (zone.edges || zone.vertices || zone.points || zone.polygon && (zone.polygon.edges || zone.polygon.vertices || zone.polygon.points) || zone.shape && (zone.shape.edges || zone.shape.vertices || zone.shape.points));
+    if (!Array.isArray(rawPoints)) {
+        return [];
     }
 
-    frontlineIndexes.sort((a, b) => a - b);
-    const unassignedReserveInfantry = reserveInfantry.slice();
+    return rawPoints.flatMap(point => {
+        if (Array.isArray(point)) {
+            return [{ x: point[0], y: point[1] }];
+        }
+        if (point && point.start && point.end) {
+            const start = Array.isArray(point.start) ? { x: point.start[0], y: point.start[1] } : point.start;
+            const end = Array.isArray(point.end) ? { x: point.end[0], y: point.end[1] } : point.end;
+            return [start, end];
+        }
+        if (point && point.x !== undefined && point.y !== undefined) {
+            return [point];
+        }
+        return [];
+    });
+}
 
-    frontlineIndexes.forEach(frontlineIndex => {
-        const frontlineUnit = frontlineInfantry[frontlineIndex];
-        let closestReserveIndex = 0;
-        let closestDistance = unassignedReserveInfantry[0].position.distanceTo(frontlineUnit.position);
+function getZoneBounds(zone, map) {
+    const points = getZonePoints(zone);
+    if (points.length >= 3) {
+        const xs = points.map(point => point.x);
+        const ys = points.map(point => point.y);
+        return {
+            x: Math.min(...xs),
+            y: Math.min(...ys),
+            width: Math.max(...xs) - Math.min(...xs),
+            height: Math.max(...ys) - Math.min(...ys)
+        };
+    }
 
-        unassignedReserveInfantry.forEach((reserveUnit, reserveIndex) => {
-            const distance = reserveUnit.position.distanceTo(frontlineUnit.position);
-            if (distance < closestDistance) {
-                closestReserveIndex = reserveIndex;
-                closestDistance = distance;
+    if (zone && zone.width !== undefined && zone.height !== undefined) {
+        return { x: zone.x, y: zone.y, width: zone.width, height: zone.height };
+    }
+
+    return map ? { x: 0, y: 0, width: map.width, height: map.height } : null;
+}
+
+function getFormationChanges(state, friendlyUnits, visibleEnemies, deploying) {
+    const changes = [];
+    const unitsById = new Map(friendlyUnits.map(unit => [unit.id, unit]));
+    const lineIds = new Set(state.lineSlots.map(slot => slot.unitId));
+
+    state.lineSlots.forEach(slot => {
+        const unit = unitsById.get(slot.unitId);
+        if (unit && infantryCategories.includes(unit.category)) {
+            const promotedIntoArtillerySlot = slot.kind === "infantry" && slot.artilleryId !== undefined;
+            const threatNearby = visibleEnemies.some(enemy => unit.position.distanceTo(enemy.position) <= engagementRange);
+            const formationId = promotedIntoArtillerySlot || threatNearby ? "line" : "column";
+            if (unit.effectiveFormation !== formationId) {
+                changes.push({ unitId: unit.id, formationId });
+            }
+        }
+    });
+
+    state.followersByArtillery.forEach((followerIds, artilleryId) => {
+        const artillery = unitsById.get(artilleryId);
+        const artilleryUnavailable = !artillery || artillery.hp <= 0 || artillery.isRoutingOrRecovering();
+        followerIds.forEach((followerId, followerIndex) => {
+            const follower = unitsById.get(followerId);
+            if (follower && !lineIds.has(follower.id)) {
+                const threatNearby = visibleEnemies.some(enemy => follower.position.distanceTo(enemy.position) <= engagementRange);
+                const formationId = threatNearby || artilleryUnavailable ? "line" : "column";
+                if (follower.effectiveFormation !== formationId) {
+                    changes.push({ unitId: follower.id, formationId });
+                }
             }
         });
-
-        const [closestReserve] = unassignedReserveInfantry.splice(closestReserveIndex, 1);
-        assignments.set(closestReserve.id, frontlineUnit.id);
     });
 
-    return assignments;
-}
-
-// function getreserveposition(frontPosition, oglineY, lineWidth) {
-//     const behindDirection = oglineY >= frontPosition.y ? 1 : -1;
-//     return {
-//         x: frontPosition.x,
-//         y: frontPosition.y + behindDirection * lineWidth * 2
-//     };
-// }
-
-function getwithdrawalposition(unit, oglineY) {
-    return {
-        x: unit.position.x,
-        y: oglineY
-    };
-}
-
-function getlineinfo(readyInfantry) {
-    const lineFormation = readyInfantry[0].gameDataManager.getUnitDimensions(
-        readyInfantry[0].type,
-        "line"
-    );
-    const lineWidth = lineFormation.height;
-    return { lineWidth, lineFormation };
-}
-
-function getobjectiveinfo(game) {
-    const objectives = game.getObjectives();
-    if (objectives.length < 2) {
-        console.log("NO OBJECTIVES???")
-        return null;
-    }
-
-    // The largest objective row is the center line, with proximity to the map center breaking ties.
-    const mapCenterY = game.map.height / 2;
-    const objectiveRows = [];
-
-    objectives.slice().sort((a, b) => a.position.y - b.position.y).forEach(objective => {
-        const matchingRow = objectiveRows.find(row => Math.abs(row.averageY - objective.position.y) <= centerObjectiveRowTolerance);
-        if (matchingRow) {
-            matchingRow.objectives.push(objective);
-            matchingRow.averageY = matchingRow.objectives.reduce((total, rowObjective) => total + rowObjective.position.y, 0) / matchingRow.objectives.length;
-        } else {
-            objectiveRows.push({ objectives: [objective], averageY: objective.position.y });
+    state.reserveIds.forEach(unitId => {
+        const unit = unitsById.get(unitId);
+        if (unit && infantryCategories.includes(unit.category)) {
+            const threatNearby = visibleEnemies.some(enemy => unit.position.distanceTo(enemy.position) <= engagementRange);
+            const formationId = threatNearby ? "line" : "column";
+            if (unit.effectiveFormation !== formationId) {
+                changes.push({ unitId: unit.id, formationId });
+            }
         }
     });
 
-    const reasonableCenterRows = objectiveRows.filter(row => row.objectives.length >= 2 && Math.abs(row.averageY - mapCenterY) <= game.map.height * centerObjectiveMaxDistanceRatio);
-    if (reasonableCenterRows.length === 0) {
-        console.log("Waiting for center stars");
-        return null;
-    }
-
-    reasonableCenterRows.sort((a, b) => b.objectives.length - a.objectives.length || Math.abs(a.averageY - mapCenterY) - Math.abs(b.averageY - mapCenterY));
-    const centerObjectives = reasonableCenterRows[0].objectives.sort((a, b) => a.position.x - b.position.x);
-    const centerObjectiveCount = centerObjectives.length;
-    console.log("Computed center star count:", centerObjectiveCount);
-
-    return {
-        leftmostCenterObjective: centerObjectives[0].position,
-        rightmostCenterObjective: centerObjectives[centerObjectives.length - 1].position
-    };
-}
-
-function getAmountThatFits(startPosition, endPosition, width) {
-    const distanceX = endPosition.x - startPosition.x;
-    const distanceY = endPosition.y - startPosition.y;
-    const distance = Math.hypot(distanceX, distanceY);
-
-    return Math.floor(distance / width);
-}
-
-function getEquallySpacedPositions(startPosition, endPosition, amount, y) {
-    if (amount <= 0) {
-        return [];
-    }
-
-    if (amount === 1) {
-        return [{
-            x: (startPosition.x + endPosition.x) / 2,
-            y: y ?? (startPosition.y + endPosition.y) / 2
-        }];
-    }
-
-    const positions = [];
-    const intervals = amount - 1;
-    const xStep = (endPosition.x - startPosition.x) / intervals;
-    const yStep = (endPosition.y - startPosition.y) / intervals;
-
-    for (let index = 0; index < amount; index += 1) {
-        positions.push({
-            x: startPosition.x + xStep * index,
-            y: y ?? startPosition.y + yStep * index
-        });
-    }
-
-    return positions;
-}
-
-function getequallyspacedtightpositions(startPosition, endPosition, spacing, amount, y) {
-    if (amount <= 0) {
-        return [];
-    }
-
-    const centerX = (startPosition.x + endPosition.x) / 2;
-    const firstX = centerX - spacing * (amount - 1) / 2;
-    const positions = [];
-
-    for (let index = 0; index < amount; index += 1) {
-        positions.push({
-            x: firstX + spacing * index,
-            y
-        });
-    }
-
-    return positions;
+    return changes;
 }
